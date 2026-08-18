@@ -1461,33 +1461,6 @@
             filter: brightness(0.55) saturate(0.5);
         }
 
-        #map-interp-control {
-            position: absolute;
-            top: 10px;
-            right: 10px;
-            z-index: 500;
-            display: flex;
-            align-items: center;
-            gap: 6px;
-            background: var(--bg-card);
-            color: var(--text-primary);
-            border: 1px solid var(--border-subtle);
-            border-radius: 4px;
-            box-shadow: var(--shadow);
-            font-family: Arial, sans-serif;
-            font-size: 0.78rem;
-            padding: 5px 10px;
-            cursor: pointer;
-            user-select: none;
-            transition: background-color 0.25s ease, color 0.25s ease, border-color 0.25s ease;
-        }
-
-        #map-interp-control input {
-            accent-color: #ffcb00;
-            margin: 0;
-            cursor: pointer;
-        }
-
         .map-offline-banner {
             display: flex;
             align-items: center;
@@ -1728,10 +1701,6 @@
         <div id="map-left">
             <div id="map-container">
                 <div id="map"></div>
-                <label id="map-interp-control"
-                    title="Dead-reckon aircraft positions between updates using the reported speed and direction">
-                    <input type="checkbox" id="interp-toggle"> Interpolate positions
-                </label>
             </div>
             <div id="resize-handle" title="Drag to resize"></div>
             <div id="aircraft-table-container">
@@ -1831,6 +1800,16 @@
         const FACTORY_BAUD = BAUD_CANDIDATES[0];
         const LAST_BAUD_KEY = 'adsbee1421LastBaud';
 
+        // How long to keep probing one rate before trying the next. Opening or reopening
+        // the port asserts DTR, which is wired (directly, or via the programmer jig's
+        // adapter emulation) to RESET_N — so the device is typically rebooting when the
+        // first probe goes out (~0.8 s app boot), and behind the programmer jig the jig
+        // itself then spends ~1–1.5 s re-negotiating the device to the host's rate
+        // before pass-through resumes. Each attempt is ~250 ms of quiet + 200 ms pause,
+        // so 6 attempts ≈ 2.7 s per rate; the device only pays this at rates it is NOT
+        // at (a live device answers the first attempt).
+        const PROBE_ATTEMPTS_PER_RATE = 6;
+
         const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
         const hex8 = (v) => (v >>> 0).toString(16).padStart(8, '0');
 
@@ -1869,38 +1848,12 @@
             return ac.track ?? ac.true_heading ?? ac.mag_heading ?? null;
         }
 
-        // Offset a lat/lon by a distance along a bearing (equirectangular — plenty
-        // accurate over the few km these projections cover).
-        function offsetPosition(lat, lon, bearingDeg, distM) {
-            const b = bearingDeg * Math.PI / 180;
-            const dLat = (distM * Math.cos(b)) / 111320;
-            const dLon = (distM * Math.sin(b)) / (111320 * Math.cos(lat * Math.PI / 180));
-            return [lat + dLat, lon + dLon];
-        }
-
         // Velocity vectors are drawn in screen space (zoom-invariant): pixel length
         // proportional to the reported speed — about one icon width (32 px) at
         // 250 kt, clamped so taxiing traffic stays visible and jets don't dominate.
         const kVectorPxPerKt = 0.128;
         const kVectorMinPx = 8;
         const kVectorMaxPx = 80;
-
-        // Cap dead-reckoning extrapolation: retained aircraft (especially ground
-        // traffic, kept for minutes through reception gaps) must not be projected
-        // far from their last fix — freeze a few seconds along-track instead.
-        const kMaxDeadReckonMs = 10000;
-
-        // Dead-reckoned position elapsedMs after the last fix. Uses whatever speed
-        // and direction the device reports (gs may be airspeed-derived for some UAT
-        // traffic). Returns the reported position when speed/direction are missing,
-        // or null when there is no position at all.
-        function deadReckon(ac, elapsedMs) {
-            if (ac.lat == null || ac.lon == null) return null;
-            const dir = acDirection(ac);
-            if (dir == null || !(ac.gs > 0) || !(elapsedMs > 0)) return [ac.lat, ac.lon];
-            const distM = ac.gs * 0.514444 * (Math.min(elapsedMs, kMaxDeadReckonMs) / 1000);
-            return offsetPosition(ac.lat, ac.lon, dir, distM);
-        }
 
         // ─── Terminal ────────────────────────────────────────────────────────────
 
@@ -2313,8 +2266,8 @@
         // work never pollutes the terminal, while visible (user-typed) commands let
         // everything flow through and just gate the queue until output goes quiet.
         //
-        // Silent-success queries (AT+LOG_LEVEL?, AT+PROTOCOL_OUT?, AT+RX_STATS?,
-        // AT+DEVICE_INFO?) print body lines but no OK — use terminator 'quiet'.
+        // Silent-success queries (AT+BAUD_RATE?, AT+LOG_LEVEL?, AT+PROTOCOL_OUT?,
+        // AT+RX_STATS?, AT+DEVICE_INFO?) print body lines but no OK — use terminator 'quiet'.
         class AtQueue {
             constructor() {
                 this.chain = Promise.resolve();
@@ -2395,6 +2348,12 @@
             feed(line) {
                 if (atQueue.tryConsume(line)) return;
                 const t = line.trim();
+                // Late answers to the page's own hidden AT+BAUD_RATE? probes: a bridge
+                // (the programmer jig) may hold probes while it re-negotiates the device
+                // and deliver them in a burst afterwards, after the probe job that sent
+                // them has given up. Only a user-typed (visible) AT+BAUD_RATE? gets to
+                // print this line.
+                if (/^BAUD_RATE=CONSOLE,\d+$/.test(t) && !(atQueue.current && atQueue.current.job.visible)) return;
                 if (t.startsWith('{')) {
                     // AIRCRAFT_JSON: newline-delimited readsb-style objects, one per aircraft.
                     // Always feed the store; hide the line from the terminal only while the
@@ -2532,7 +2491,6 @@
                 this.aircraft = new Map();  // hex → latest state snapshot
                 this.trails = new Map();    // hex → [{lat, lon, alt}]
                 this.lastSeen = new Map();  // hex → Date.now() timestamp
-                this.fixTimes = new Map();  // hex → Date.now() of the last position fix
             }
 
             ingest(ac) {
@@ -2544,7 +2502,6 @@
                 this.aircraft.set(ac.hex, ac);
                 this.lastSeen.set(ac.hex, Date.now());
                 if (ac.lat != null && ac.lon != null) {
-                    this.fixTimes.set(ac.hex, Date.now());
                     const t = this.trails.get(ac.hex) || [];
                     t.push({ lat: ac.lat, lon: ac.lon, alt: ac.alt_baro ?? null });
                     if (t.length > kMaxTrailPoints) t.shift();
@@ -2566,7 +2523,6 @@
                         this.aircraft.delete(hex);
                         this.trails.delete(hex);
                         this.lastSeen.delete(hex);
-                        this.fixTimes.delete(hex);
                     }
                 }
             }
@@ -2575,7 +2531,6 @@
                 this.aircraft.clear();
                 this.trails.clear();
                 this.lastSeen.clear();
-                this.fixTimes.clear();
             }
 
             all() { return [...this.aircraft.values()]; }
@@ -2590,7 +2545,6 @@
                 this.map = null;
                 this.markers = new Map();   // hex → L.Marker
                 this.trailLines = new Map();   // hex → L.LayerGroup
-                this.interpolate = false;      // dead-reckon positions between fixes
                 this.selectedHex = null;
                 this.onSelectionChanged = null;        // (hex | null) → void
                 this._ready = false;
@@ -2679,7 +2633,6 @@
                 if (!this._ready) return;
                 const live = new Set();
 
-                const now = Date.now();
                 for (const ac of this.store.all()) {
                     if (ac.lat == null || ac.lon == null) continue;
                     live.add(ac.hex);
@@ -2687,9 +2640,7 @@
                     const isGround = !!ac.on_ground;
                     const isSel = ac.hex === this.selectedHex;
                     const icon = this._makeIcon(color, acDirection(ac), isGround, isSel, ac.gs);
-                    const pos = this.interpolate
-                        ? deadReckon(ac, now - (this.store.fixTimes.get(ac.hex) ?? now))
-                        : [ac.lat, ac.lon];
+                    const pos = [ac.lat, ac.lon];
 
                     if (this.markers.has(ac.hex)) {
                         const m = this.markers.get(ac.hex);
@@ -2730,21 +2681,6 @@
                         this._clearTrail(hex);
                         if (hex === this.selectedHex) this.deselect();
                     }
-                }
-            }
-
-            // Fast dead-reckoning pass between 1 Hz updates (only called while the
-            // interpolation toggle is on). Moves markers (their embedded velocity
-            // vectors ride along); trails, table, and sidebar keep raw values.
-            interpolateTick() {
-                if (!this._ready || !this.interpolate) return;
-                const now = Date.now();
-                for (const [hex, m] of this.markers) {
-                    const ac = this.store.aircraft.get(hex);
-                    if (!ac) continue;
-                    const pos = deadReckon(ac, now - (this.store.fixTimes.get(hex) ?? now));
-                    if (!pos) continue;
-                    m.setLatLng(pos);
                 }
             }
 
@@ -2963,17 +2899,6 @@
         let radarMap = null;
         let acTable = null;
         let sweepTimer = null;
-        let interpTimer = null;
-
-        function updateInterpTimer() {
-            const on = radarMap && radarMap.interpolate && tabController.active === 'map';
-            if (on && !interpTimer) {
-                interpTimer = setInterval(() => radarMap.interpolateTick(), 100);
-            } else if (!on && interpTimer) {
-                clearInterval(interpTimer);
-                interpTimer = null;
-            }
-        }
 
         function initMapTab() {
             if (!radarMap) {
@@ -2983,7 +2908,6 @@
             } else {
                 radarMap.invalidate();
             }
-            radarMap.interpolate = document.getElementById('interp-toggle').checked;
             if (!acTable) {
                 acTable = new AircraftTable('aircraft-tbody', aircraftStore, (hex) => {
                     if (radarMap) radarMap.selectAircraft(hex);
@@ -2996,14 +2920,11 @@
                     if (acTable) acTable.update();
                 }, 1000);
             }
-            updateInterpTimer();
         }
 
         function stopMapTimers() {
             clearInterval(sweepTimer);
             sweepTimer = null;
-            clearInterval(interpTimer);
-            interpTimer = null;
         }
 
         function initResizeHandle() {
@@ -3151,6 +3072,11 @@
             CCFG_BASE: 0x50000000,
             CCFG_SIZE: 0x800,
             SECTOR_SIZE: 0x800,            // 2 KB
+            // Top 16 KB of the main bank is persistent storage owned by the firmware, never by
+            // the image: Settings @ 0x000FC000 (8 KB) and Device Info / OTA keys @ 0x000FE000
+            // (8 KB) -- see firmware/adsbee_1421/ti/settings/settings.cpp. The flasher erases only
+            // image-covered sectors so these survive a reflash; an image reaching up here is refused.
+            PROTECTED_FLASH_START: 0x000FC000,
 
             parse(text) {
                 let extBase = 0;
@@ -3537,10 +3463,38 @@
                     const chipId = await bl.getChipId();
                     this.logLine(`Bootloader up, chip ID: 0x${hex8(chipId).toUpperCase()}`);
 
-                    this.setStatus('Erasing main flash bank...');
+                    // Erase only the 2 KB sectors the image covers -- deliberately NOT a bank
+                    // erase, which would wipe the Settings and Device Info / OTA key sectors at the
+                    // top of the bank. All main sectors are erased before anything is programmed
+                    // (two segments can share a sector). Refuse up front if the image reaches into
+                    // the protected region so nothing is erased on a bad image.
+                    for (const seg of this._image.main) {
+                        if (seg.addr + seg.data.length > IntelHex.PROTECTED_FLASH_START) {
+                            throw new Error(`Refusing to flash: segment 0x${hex8(seg.addr)} ` +
+                                `(${seg.data.length} bytes) overlaps the reserved settings / ` +
+                                `device-info region at 0x${hex8(IntelHex.PROTECTED_FLASH_START)}.`);
+                        }
+                    }
+                    const sectorsToErase = [];
+                    for (const seg of this._image.main) {
+                        const start = seg.addr - (seg.addr % IntelHex.SECTOR_SIZE);
+                        const end = seg.addr + seg.data.length;
+                        for (let a = start; a < end; a += IntelHex.SECTOR_SIZE) {
+                            if (!sectorsToErase.includes(a)) sectorsToErase.push(a);
+                        }
+                    }
+                    sectorsToErase.sort((a, b) => a - b);
+                    this.setStatus(`Erasing ${sectorsToErase.length} image sectors...`);
                     this._eraseStarted = true;
-                    await bl.bankErase();
-                    this.logLine('Main flash bank erased.');
+                    for (let i = 0; i < sectorsToErase.length; i++) {
+                        await bl.sectorErase(sectorsToErase[i]);
+                        if ((i + 1) % 32 === 0 || i + 1 === sectorsToErase.length) {
+                            this.setStatus(`Erasing image sectors... ${i + 1}/${sectorsToErase.length}`);
+                        }
+                    }
+                    this.logLine(`${sectorsToErase.length} image sectors erased ` +
+                        `(0x${hex8(sectorsToErase[0])}..0x${hex8(sectorsToErase[sectorsToErase.length - 1] + IntelHex.SECTOR_SIZE)}); ` +
+                        'device info and settings preserved.');
                     if (this._image.ccfg.length) {
                         // Erasing CCFG restores TI factory defaults (bootloader enabled), so a
                         // failure after this point leaves the device recoverable over UART.
@@ -3586,8 +3540,9 @@
                     this.setProgress(100);
 
                     // Back to console mode. The device reboots at its saved console baud
-                    // (a fresh settings blob means the factory default) — re-sweep to
-                    // find it.
+                    // (settings persist across the flash unless the firmware's settings
+                    // version changed, in which case they reset to factory default) —
+                    // re-sweep to find it.
                     serial.setSink(new LineSink(lineRouter));
                     this.active = false;
                     this._state = 'done';
@@ -3703,18 +3658,46 @@
                 this.dot.title = `Connected (${serial.currentBaud} 8N1)`;
             },
 
-            // Liveness check at the current baud: AT+LOG_LEVEL? is supported by all
-            // firmware versions and is silent-success (body line, no OK).
-            async probe(attempts = 3) {
+            // One AT+BAUD_RATE? round trip (silent-success: body line, no OK). Returns
+            // the whitelisted rate the device says its console is at, or null when
+            // nothing legible came back within the window.
+            async _queryDeviceBaud() {
+                try {
+                    const lines = await atQueue.send('AT+BAUD_RATE?\r\n',
+                        { expect: /^BAUD_RATE=CONSOLE,\d+/, terminator: 'quiet', quietMs: 250, timeoutMs: 700 });
+                    for (const l of lines) {
+                        const n = parseInt(l.split(',')[1], 10);
+                        if (BAUD_CANDIDATES.includes(n)) return n;
+                    }
+                } catch (_) { }
+                return null;
+            },
+
+            // Liveness check at the current host rate: keep asking AT+BAUD_RATE? for up
+            // to `attempts` rounds (the device may still be booting after the DTR reset
+            // that opening the port causes, or a bridge may still be bringing it up).
+            //
+            // Any legible reply proves the link works, and the device's answer — not
+            // the rate this page opened the port at — is the truth about the console
+            // rate: behind a USB bridge (the programmer jig) the host's baud is virtual
+            // and the jig retunes the device on its own. When the two differ, a second
+            // consecutive legible reply is required so a single stale line buffered
+            // from an earlier rate can't be mistaken for a live link.
+            //
+            // Returns the device's rate, or null.
+            async probe(attempts = PROBE_ATTEMPTS_PER_RATE) {
+                let unconfirmed = null;
                 for (let i = 0; i < attempts; i++) {
-                    try {
-                        const lines = await atQueue.send('AT+LOG_LEVEL?\r\n',
-                            { expect: /^LOG_LEVEL=/, terminator: 'quiet', quietMs: 250, timeoutMs: 700 });
-                        if (lines.length) return true;
-                    } catch (_) { }
+                    const n = await this._queryDeviceBaud();
+                    if (n !== null) {
+                        if (n === serial.currentBaud || n === unconfirmed) return n;
+                        unconfirmed = n;
+                        continue;   // re-ask straight away to confirm
+                    }
+                    unconfirmed = null;
                     if (i + 1 < attempts) await sleep(200);
                 }
-                return false;
+                return null;
             },
 
             async _reopenWithSink(baud) {
@@ -3733,36 +3716,70 @@
                 return order;
             },
 
-            // Find the device's baud rate: single-attempt probe (~700 ms) at each
-            // candidate. Returns the rate that answered, or null.
+            // Find the device: probe patiently at each candidate host rate in turn.
+            // Reopening the port at the next candidate resets the device again (DTR),
+            // so a rate is only abandoned after the device has had time to come back.
+            // Returns the rate the device reports, or null.
             async sweep() {
                 for (const baud of this._sweepOrder()) {
                     if (baud !== serial.currentBaud) await this._reopenWithSink(baud);
-                    if (await this.probe(1)) {
-                        try { localStorage.setItem(LAST_BAUD_KEY, String(baud)); } catch (_) { }
-                        return baud;
+                    const found = await this.probe();
+                    if (found !== null) {
+                        // Only remember a rate the host itself opened successfully.
+                        if (found === serial.currentBaud) {
+                            try { localStorage.setItem(LAST_BAUD_KEY, String(found)); } catch (_) { }
+                        }
+                        return found;
                     }
                 }
                 return null;
             },
 
+            _announceLink(deviceBaud) {
+                if (deviceBaud === serial.currentBaud) {
+                    tabController.notice(`Console link at ${deviceBaud} baud.`);
+                } else {
+                    tabController.notice(
+                        `Console link up: device console at ${deviceBaud} baud ` +
+                        `(host port opened at ${serial.currentBaud} — a bridge is retuning the device independently).`);
+                }
+            },
+
+            // Negotiations share one serial port, so they must never interleave: each
+            // reopens the port at its own candidate rates, and two running at once
+            // (connect + post-flash re-sweep, AT+REBOOT hook + auto-reconnect, ...) can
+            // each mistake the other's rate for its own. _exclusive() runs fn after any
+            // section already in flight; negotiate() additionally coalesces, so a
+            // second caller joins the running sweep instead of queueing another.
+            _negChain: Promise.resolve(),
+            _negotiation: null,
+
+            _exclusive(fn) {
+                const p = this._negChain.then(fn);
+                this._negChain = p.then(() => { }, () => { });   // never rejects, so the chain can't wedge
+                return p;
+            },
+
             // Lock onto whatever rate the device is at. The device boots at its saved
             // console baud (factory default 1,000,000), so there is nothing to negotiate
-            // up to — just find it. The second pass covers a device that was still
-            // booting during the first (e.g. reset when the port reopened — DTR wired
-            // to RESET_N).
-            async negotiate() {
-                let baud = await this.sweep();
-                if (baud === null) {
-                    await sleep(1000);
-                    baud = await this.sweep();
-                }
+            // up to — just find it (each rate is given time for a post-reset boot, see
+            // PROBE_ATTEMPTS_PER_RATE).
+            negotiate() {
+                if (this._negotiation) return this._negotiation;
+                this._negotiation = this._exclusive(() => this._negotiateImpl())
+                    .finally(() => { this._negotiation = null; });
+                return this._negotiation;
+            },
+
+            // Body of negotiate(); only call from inside an _exclusive() section.
+            async _negotiateImpl() {
+                const baud = await this.sweep();
                 if (baud === null) {
                     tabController.notice(
                         `No response from the device at any supported baud rate (${BAUD_CANDIDATES.join(', ')}). Is it connected and running?`);
                     return;
                 }
-                tabController.notice(`Console link at ${baud} baud.`);
+                this._announceLink(baud);
             },
 
             // After something reboots the device (AT+REBOOT, firmware flash, settings
@@ -3779,18 +3796,24 @@
             // Follow a hand-typed AT+BAUD_RATE=CONSOLE,<n>: the device has already
             // switched by the time this runs; reopen at the announced rate and fall back
             // to a full sweep if it doesn't answer there.
-            async followManualBaudChange(baud) {
-                if (!serial.connected) return;
-                try {
-                    await this._reopenWithSink(baud);
-                    if (await this.probe()) {
-                        try { localStorage.setItem(LAST_BAUD_KEY, String(baud)); } catch (_) { }
-                        tabController.notice(`Console link at ${baud} baud.`);
-                    } else {
-                        await this.negotiate();
-                    }
-                    this._setConnectedIndicators();
-                } catch (_) { }
+            followManualBaudChange(baud) {
+                if (!serial.connected) return Promise.resolve();
+                return this._exclusive(async () => {
+                    if (!serial.connected) return;
+                    try {
+                        await this._reopenWithSink(baud);
+                        const found = await this.probe();
+                        if (found !== null) {
+                            if (found === serial.currentBaud) {
+                                try { localStorage.setItem(LAST_BAUD_KEY, String(found)); } catch (_) { }
+                            }
+                            this._announceLink(found);
+                        } else {
+                            await this._negotiateImpl();
+                        }
+                        this._setConnectedIndicators();
+                    } catch (_) { }
+                });
             },
 
             async disconnect() {
@@ -3857,16 +3880,6 @@
             flashController.init();
             document.getElementById('sidebar-close').addEventListener('click', () => {
                 if (radarMap) radarMap.deselect();
-            });
-            const interpToggle = document.getElementById('interp-toggle');
-            interpToggle.checked = localStorage.getItem('interpolate') === 'true';
-            interpToggle.addEventListener('change', () => {
-                localStorage.setItem('interpolate', interpToggle.checked ? 'true' : 'false');
-                if (radarMap) {
-                    radarMap.interpolate = interpToggle.checked;
-                    radarMap.update();   // re-render at raw/DR positions immediately
-                }
-                updateInterpTimer();
             });
             initResizeHandle();
             appendToTerminal('ADSBee 1421 Web Console\n');

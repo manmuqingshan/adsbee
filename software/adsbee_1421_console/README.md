@@ -12,10 +12,17 @@ Chrome or Edge (works from `file://`, no server needed) and click **Connect**
   (`AT+BAUD_RATE` + `AT+SETTINGS=SAVE`; factory default 1,000,000), so it may be
   at any of {115200, 230400, 460800, 921600, 1000000}. On connect the page
   sweeps that list — trying last session's rate first — and locks onto whatever
-  rate answers. After `AT+REBOOT`, `AT+SETTINGS=RESET`, or a firmware flash the
-  page re-sweeps automatically, and a hand-typed `AT+BAUD_RATE=CONSOLE,<n>`
-  is followed to the new rate instead of desyncing the link. Disconnecting
-  leaves the device at its current rate.
+  rate answers. Each probe is `AT+BAUD_RATE?`, repeated for ~2.7 s per rate
+  before moving on (opening the port asserts DTR, which resets the device, so it
+  is usually still booting when the first probe goes out), and the rate shown is
+  the one the device itself reports. Behind the programmer jig
+  (`firmware/adsbee_1421/programmer/`) the host baud is virtual and the jig
+  retunes the device to it after each host-driven reset; the page waits that
+  out and, if the device's rate ever differs from the host port's, says so
+  rather than guessing. After `AT+REBOOT`,
+  `AT+SETTINGS=RESET`, or a firmware flash the page re-sweeps automatically, and
+  a hand-typed `AT+BAUD_RATE=CONSOLE,<n>` is followed to the new rate instead of
+  desyncing the link. Disconnecting leaves the device at its current rate.
 - **Console tab** — interactive AT command terminal (line editing, history, ANSI
   colors), a Receiver Statistics panel, a Device Status card, and firmware upload.
   - Statistics update whenever an `RX_STATS=` response appears — type
@@ -40,11 +47,6 @@ Chrome or Edge (works from `file://`, no server needed) and click **Connect**
   - Each moving aircraft gets a **velocity vector**: a screen-space line along its
     direction whose length scales with speed (about one icon width at 250 kt,
     clamped) — zooming the map never changes its on-screen size.
-  - The **Interpolate positions** toggle (top-right of the map, persisted) dead-reckons
-    aircraft between the 1 Hz updates using the reported speed and direction, so
-    fast traffic glides instead of jumping. The speed used is whatever the device
-    reports (`gs`, which may be airspeed-derived for some UAT traffic). Trails,
-    table, and sidebar always show raw reported values.
   - These changes are RAM-only (`AT+SETTINGS=SAVE` is never issued), so a device
     power cycle always returns to the persisted configuration — including if the
     page is closed while on the Map tab (a best-effort restore is attempted on
@@ -67,6 +69,10 @@ the boot ROM enters the serial bootloader; if that fails it falls back to
 CCFG must enable the bootloader backdoor (see the flasher README).
 
 Entry never erases anything by itself; erase begins only after the bootloader ACKs.
+Only the 2 KB flash sectors covered by the image are erased (`SECTOR_ERASE`, never a
+bank erase), so the module's Settings (`0x000FC000`) and Device Info / OTA keys
+(`0x000FE000`) survive a reflash; an image that reaches into those sectors is refused
+before anything is erased.
 If a flash fails partway, the device stays in the ROM bootloader — reopen the dialog
 and **Retry**. The board cannot be bricked (an interrupted flash leaves the
 factory-default CCFG, which keeps the bootloader enabled).
