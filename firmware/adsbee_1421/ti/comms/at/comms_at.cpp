@@ -444,7 +444,9 @@ CPP_AT_CALLBACK(CommsManager::ATRxEnableCallback) {
                 bool all_enabled;
                 CPP_AT_TRY_ARG2NUM(0, all_enabled);
                 adsbee.SetRx1090Enabled(all_enabled);
-                adsbee.SetRxSubGHzEnabled(all_enabled);
+                if (!adsbee.SetRxSubGHzEnabled(all_enabled)) {
+                    CPP_AT_ERROR("Failed to %s the Sub-GHz receiver.", all_enabled ? "enable" : "disable");
+                }
             } else {
                 if (CPP_AT_HAS_ARG(1)) {
                     bool rx_1090_enabled;
@@ -454,7 +456,9 @@ CPP_AT_CALLBACK(CommsManager::ATRxEnableCallback) {
                 if (CPP_AT_HAS_ARG(2)) {
                     bool rx_subg_enabled;
                     CPP_AT_TRY_ARG2NUM(2, rx_subg_enabled);
-                    adsbee.SetRxSubGHzEnabled(rx_subg_enabled);
+                    if (!adsbee.SetRxSubGHzEnabled(rx_subg_enabled)) {
+                        CPP_AT_ERROR("Failed to %s the Sub-GHz receiver.", rx_subg_enabled ? "enable" : "disable");
+                    }
                 }
             }
             CPP_AT_SUCCESS();
@@ -694,10 +698,12 @@ CPP_AT_CALLBACK(CommsManager::ATSubGRxModeCallback) {
             for (uint16_t i = 0; i < SettingsManager::kNumSubGHzRadioModes; i++) {
                 if (args[0].compare(SettingsManager::kSubGHzModeStrs[i]) == 0) {
                     SettingsManager::SubGHzRadioMode mode = static_cast<SettingsManager::SubGHzRadioMode>(i);
-                    settings_manager.settings.subg_mode = mode;
+                    // Apply to the radio first; only mirror into the settings struct once it took, so a failed
+                    // restart can't leave RAM settings (and a later AT+SETTINGS=SAVE) disagreeing with the radio.
                     if (!subg_radio.SetMode(mode)) {
                         CPP_AT_ERROR("Failed to restart Sub-GHz RX in mode %s.", args[0].data());
                     }
+                    settings_manager.settings.subg_mode = mode;
                     CPP_AT_SUCCESS();
                 }
             }
@@ -936,6 +942,7 @@ CPP_AT_CALLBACK(CommsManager::ATRxCWCallback) {
     int16_t max_rssi_x2 = INT16_MIN;
     int16_t cur_rssi_x2 = INT16_MIN;
     bool have_sample = false;
+    bool last_sample_valid = false;
     static constexpr uint32_t kRssiPrintIntervalMs = 1 * kMsPerSec;
     uint32_t last_print_timestamp_ms = get_time_since_boot_ms();
     char c;
@@ -957,6 +964,7 @@ CPP_AT_CALLBACK(CommsManager::ATRxCWCallback) {
                 sample_valid = true;
             }
         }
+        last_sample_valid = sample_valid;
         if (sample_valid) {
             have_sample = true;
             if (cur_rssi_x2 > max_rssi_x2) {
@@ -966,8 +974,10 @@ CPP_AT_CALLBACK(CommsManager::ATRxCWCallback) {
 
         if (get_time_since_boot_ms() - last_print_timestamp_ms >= kRssiPrintIntervalMs) {
             if (have_sample) {
+                // Show "n/a" rather than the last good value when the most recent read failed, so a receiver
+                // that stopped reporting is visible instead of appearing frozen at its last reading.
                 CPP_AT_PRINTF("RSSI: cur %s dBm, max %s dBm\r\n",
-                              RssiHalfDbToStr(cur_rssi_x2, cur_str, sizeof(cur_str)),
+                              last_sample_valid ? RssiHalfDbToStr(cur_rssi_x2, cur_str, sizeof(cur_str)) : "n/a",
                               RssiHalfDbToStr(max_rssi_x2, max_str, sizeof(max_str)));
             } else {
                 CPP_AT_PRINTF("RSSI: no valid samples yet.\r\n");
@@ -989,6 +999,12 @@ CPP_AT_CALLBACK(CommsManager::ATRxCWCallback) {
 
     if (!restore_ok) {
         CPP_AT_ERROR("Failed to restore normal reception.");
+    }
+
+    if (band == kBandSubG && subg_radio.rssi_scan_rx_restart_count > 0) {
+        // The RX command ended (false sync / RX buffer error, typically under a strong carrier) and had to be
+        // re-armed to keep RSSI live. Report it for bench characterization.
+        CPP_AT_PRINTF("Rx restarts during scan: %lu\r\n", (unsigned long)subg_radio.rssi_scan_rx_restart_count);
     }
 
     if (have_sample) {
@@ -1148,7 +1164,12 @@ bool CommsManager::UpdateAT() {
             stdio_at_command_buf[stdio_at_command_buf_len] = '\0';  // clear command buffer
         }
         if (c == '\n') {
-            at_parser_.ParseMessage(std::string_view(stdio_at_command_buf));
+            // Ignore blank lines (bare Enter / stray CR-LF) instead of handing them to cppAT, which would print an
+            // "Unable to find AT prefix" error. Terminals (and the web console) send a bare newline as the
+            // "press any key" keystroke that stops AT+RX_CW / AT+TX_CW, and it should otherwise be silent.
+            if (strspn(stdio_at_command_buf, " \t\r\n") != stdio_at_command_buf_len) {
+                at_parser_.ParseMessage(std::string_view(stdio_at_command_buf));
+            }
             stdio_at_command_buf_len = 0;
             stdio_at_command_buf[stdio_at_command_buf_len] = '\0';  // clear command buffer
         }
