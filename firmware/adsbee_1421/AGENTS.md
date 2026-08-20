@@ -88,7 +88,9 @@ In `ti/build/<Config>/`:
 | `adsbee_1421-<version>.hex` / `.elf` / `.map` | Version-stamped copies for release/CI (e.g. `adsbee_1421-0.3.6.hex`); version is parsed from `object_dictionary.cpp`. |
 
 In `programmer/build/<Config>/`: `adsbee_1421_programmer.uf2` (drag-and-drop onto the
-RP2040-Zero over BOOT) with the `ti` Release hex baked in.
+RP2040-Zero over BOOT) with the `ti` Release hex baked in, plus version-stamped copies
+`adsbee_1421_programmer-fw<version>.uf2` / `.elf` — the `fw` prefix marks the version as that of
+the **baked firmware** (the programmer has no version of its own), matching the names CI publishes.
 
 ## Version management
 
@@ -99,7 +101,8 @@ RP2040-Zero over BOOT) with the `ti` Release hex baked in.
 adsbee_1090's. Any change under `firmware/adsbee_1421/` or the shared `firmware/common/` must be
 paired with an adsbee_1421 firmware version bump — enforced by
 [`../scripts/check_version_sync.sh`](../scripts/check_version_sync.sh), which `build.sh` runs
-before every build (and the repo pre-commit hook runs on every commit). Note that a
+before every build (as a warning only — it never blocks the build) and which the repo pre-commit
+hook runs on every commit (where it does block). Note that a
 `firmware/common/` change requires bumping **both** products' versions.
 
 ## Flashing

@@ -74,9 +74,9 @@ GPIO_PinConfig gpioPinConfigs[48] = {
     /* Owned by COPRO_SPI as SCLK */
     GPIO_CFG_INPUT_INTERNAL | GPIO_CFG_IN_INT_NONE | GPIO_CFG_PULL_DOWN_INTERNAL, /* COPRO_SPI_SCLK */
     GPIO_CFG_OUTPUT_INTERNAL | GPIO_CFG_OUT_STR_MED | GPIO_CFG_OUT_HIGH, /* LR_CS */
-    GPIO_CFG_NO_DIR, /* DIO_12 */
+    GPIO_CFG_INPUT_INTERNAL | GPIO_CFG_IN_INT_RISING | GPIO_CFG_PULL_DOWN_INTERNAL, /* LR_IRQ */
     GPIO_CFG_NO_DIR, /* DIO_13 */
-    GPIO_CFG_INPUT_INTERNAL | GPIO_CFG_IN_INT_NONE | GPIO_CFG_PULL_NONE_INTERNAL, /* LR_BUSY */
+    GPIO_CFG_INPUT_INTERNAL | GPIO_CFG_IN_INT_FALLING | GPIO_CFG_PULL_NONE_INTERNAL, /* LR_BUSY */
     GPIO_CFG_OUTPUT_INTERNAL | GPIO_CFG_OUT_STR_MED | GPIO_CFG_OUT_HIGH, /* LR_RESET */
     GPIO_CFG_NO_DIR, /* DIO_16 */
     GPIO_CFG_NO_DIR, /* DIO_17 */
@@ -134,6 +134,7 @@ const uint_least8_t LR_RESET_CONST = LR_RESET;
 const uint_least8_t RSUBG_LED_CONST = RSUBG_LED;
 const uint_least8_t SUBG_DIO27_CONST = SUBG_DIO27;
 const uint_least8_t SYNC_CONST = SYNC;
+const uint_least8_t LR_IRQ_CONST = LR_IRQ;
 const uint_least8_t COPRO_SPI_SCLK_CONST = COPRO_SPI_SCLK;
 const uint_least8_t COPRO_SPI_POCI_CONST = COPRO_SPI_POCI;
 const uint_least8_t COPRO_SPI_PICO_CONST = COPRO_SPI_PICO;
@@ -184,8 +185,8 @@ const PowerCC26X2_Config PowerCC26X2_config = {
  * Platform-specific driver configuration
  */
 const RFCC26XX_HWAttrsV2 RFCC26XX_hwAttrs = {
-    .hwiPriority        = (~0),
-    .swiPriority        = (uint8_t)0,
+    .hwiPriority        = 0xa0,
+    .swiPriority        = (uint8_t)1,
     .xoscHfAlwaysNeeded = true,
     .globalCallback     = NULL,
     .globalEventMask    = 0
@@ -225,7 +226,7 @@ const SPICC26X4DMA_HWAttrs spiCC26X4DMAHWAttrs[CONFIG_SPI_COUNT] = {
     {
         .baseAddr = SPI0_BASE,
         .intNum = INT_SPI0_COMB,
-        .intPriority = (~0),
+        .intPriority = 0xa0,
         .swiPriority = 0,
         .powerMngrId = PowerCC26XX_PERIPH_SSI0,
         .defaultTxBufValue = 0x00,

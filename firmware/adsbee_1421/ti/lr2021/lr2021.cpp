@@ -9,9 +9,12 @@
 
 LR2021::LR2021(LR2021Config config) : config_(config), mode_(ChipMode::kStartup), last_stat_{} {
     SPI_Params_init(&spi_params_);
-    spi_params_.transferMode = SPI_MODE_BLOCKING;
-    // spi_params_.transferTimeout = SPI_WAIT_FOREVER;
-    // spi_params_.transferCallbackFxn = spi_transfer_complete_callback;
+    // Callback (DMA) mode for every transfer. transferMode is latched at SPI_open, so a single mode must
+    // serve both the async RX drain (lr2021_async.cpp) and the ~110 synchronous command call sites; the
+    // latter go through the post-and-spin shim in SPITransfer() (lr2021_ll.cpp) and keep their blocking
+    // semantics unchanged.
+    spi_params_.transferMode = SPI_MODE_CALLBACK;
+    spi_params_.transferCallbackFxn = &LR2021::SPICallback;
     spi_params_.mode = SPI_CONTROLLER;
     spi_params_.bitRate = 12'000'000;  // Use max clock rate for CC1314 (12MHz).
     spi_params_.dataSize = 8;
@@ -22,6 +25,23 @@ LR2021::LR2021(LR2021Config config) : config_(config), mode_(ChipMode::kStartup)
 
 bool LR2021::Init() {
     abort_requested_ = false;
+    // Reset the async RX drain: no transfer can be in flight here (DeInit cancels before SPI_close, and
+    // a first-ever Init starts from the zero-initialized members).
+    drain_state_ = DrainState::kIdle;
+    async_done_ = false;
+    async_ok_ = false;
+    async_in_flight_ = false;
+    sync_done_ = false;
+    memset(async_tx_buf_, 0, sizeof(async_tx_buf_));  // [2..] must clock zeros during FIFO reads.
+    // IRQ chain TX buffers: static contents, pre-packed once so the ISR-side chain never packs bytes.
+    // Filled staging slots are deliberately preserved across re-inits -- the thread parses them on its
+    // own schedule (e.g. after a sync-sleep wake).
+    memset(chain_fifo_tx_buf_, 0, sizeof(chain_fifo_tx_buf_));  // [2..] clocks zeros during the read.
+    PackU16(chain_fifo_tx_buf_, kOpcodeReadRxFifo);
+    PackU16(chain_clear_tx_buf_, kOpcodeClearFifoIrqFlags);
+    chain_clear_tx_buf_[2] = 0x3F;  // All RX FIFO sub-flags.
+    chain_clear_tx_buf_[3] = 0x00;
+    PackU16(chain_irq_tx_buf_, kOpcodeGetAndClearIrq);
     CONSOLE_INFO("LR2021::Init", "Initializing.");
     // Do a proper reboot.
     SetEnable(false);
@@ -62,6 +82,9 @@ bool LR2021::DeInit() {
     CONSOLE_INFO("LR2021::DeInit", "De-initializing.");
     SetEnable(false);
     if (spi_handle_ != nullptr) {
+        // Never close the handle with a DMA in flight: cancel any async drain transfer first (also
+        // covers EnterSyncSleep, which reaches here with a drain possibly mid-sequence).
+        CancelAsync();
         SPI_close(spi_handle_);
         spi_handle_ = nullptr;
     }
@@ -117,6 +140,18 @@ bool LR2021::WaitUntilReady(uint32_t timeout_ms) {
 }
 
 bool LR2021::BeginTransaction() {
+    // Bus-ownership guard: a synchronous command may be issued (AT handlers, config paths) while the
+    // async RX drain is mid-sequence, since a drain spans main-loop iterations. Pump the drain to a
+    // quiescent state (idle / data-ready / error: no DMA in flight, NSS high) so the two can't
+    // interleave NSS frames. Bounded: in-flight DMA completes in microseconds and every BUSY wait has
+    // its own kBusyTimeoutMs, so the worst case is the tail of one drain sequence (~sub-millisecond).
+    while (drain_state_ != DrainState::kIdle && drain_state_ != DrainState::kDataReady &&
+           drain_state_ != DrainState::kError) {
+        if (abort_requested_) {
+            return false;
+        }
+        ServiceRxDrain();
+    }
     // Always verify the chip is idle before asserting NSS.  Per §5.4.1.1 the
     // LR2021 will immediately raise BUSY once it sees the NSS falling edge, so
     // checking BUSY *after* asserting NSS would race with the hardware.
@@ -267,15 +302,32 @@ bool LR2021::SetOokADSB(SettingsManager::R1090PreambleMode preamble_mode, uint8_
         return false;
     }
 
-    // Set up the FIFO.
+    // Set up the FIFO. The high threshold doubles as the IRQ-paced drain valve: kIrqRxFifo latches
+    // (and the DIO6 IRQ line rises) only once 9 whole packets have accumulated, i.e. only when the
+    // main loop's routine level-read sweep is falling behind. The loop drain does NOT gate on this
+    // flag (it reads the level unconditionally), so sub-threshold packets still flow with loop
+    // latency.
+    static_assert(GetOokRxPacketLenBytes(SettingsManager::kR1090PreambleModeModeS) == kOokFifoPacketLenBytes &&
+                      GetOokRxPacketLenBytes(SettingsManager::kR1090PreambleModeDF17) == kOokFifoPacketLenBytes &&
+                      GetOokRxPacketLenBytes(SettingsManager::kR1090PreambleModeModeSSwCrc) == kOokFifoPacketLenBytes,
+                  "IRQ drain threshold math assumes 14-byte FIFO packets in every preamble mode.");
     uint8_t rx_fifo_flags = kFifoIrqFlagFifoHigh | kFifoIrqFlagFifoOverflow;
     uint8_t tx_fifo_flags = 0x0;
-    // Low threshold will trigger as soon as there is any amount of data, high threshold will trigger as soon as there's
-    // a lot of data.
     uint16_t rx_fifo_low_threshold = 0;  // Not actually used.
-    uint16_t rx_fifo_high_threshold = 14;
+    uint16_t rx_fifo_high_threshold = kIrqDrainThresholdBytes;
     if (!ConfigFifoIrqAdv(rx_fifo_flags, tx_fifo_flags, rx_fifo_high_threshold, 0, rx_fifo_low_threshold, 0)) {
         CONSOLE_ERROR("LR2021::SetOokADSB", "Error during ConfigFifoIrqAdv.");
+        return false;
+    }
+    // Route the RX FIFO IRQ to DIO6, which is wired to the CC1314's LR_IRQ pin (rising-edge
+    // interrupt; see lr2021_irq_drain.cpp). The IRQ register bit is latched: the drain paths clear it
+    // over SPI (ClearFifoIrqFlags then GetAndClearIrq) to drop the line.
+    if (!SetDioFunction(DioNum::kDio6, DioFunc::kDioFuncIrq, PullDrive::kPullNone)) {
+        CONSOLE_ERROR("LR2021::SetOokADSB", "Error during SetDioFunction for the IRQ line.");
+        return false;
+    }
+    if (!SetDioIrqConfig(DioNum::kDio6, HostIrqs::kIrqRxFifo)) {
+        CONSOLE_ERROR("LR2021::SetOokADSB", "Error during SetDioIrqConfig for the IRQ line.");
         return false;
     }
 
