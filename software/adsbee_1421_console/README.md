@@ -55,6 +55,27 @@ Chrome or Edge (works from `file://`, no server needed) and click **Connect**
     power cycle always returns to the persisted configuration — including if the
     page is closed while on the Map tab (a best-effort restore is attempted on
     close, but cannot be guaranteed).
+- **Settings tab** — a schema-driven form for every read/write settings AT command
+  (receivers, gain/preamble/boost, sub-GHz mode, output protocol, MAVLink IDs,
+  receiver position, console baud, log level, watchdog). Edits are applied with a
+  single **Save** button, which sends only the changed `AT+<CMD>=` commands and then
+  `AT+SETTINGS=SAVE`; **Refresh** re-reads everything from the device and discards
+  edits. Reads happen in one round trip via `AT+SETTINGS?JSON` (a single-line JSON
+  dump keyed by AT command), falling back automatically to per-command queries on
+  firmware that predates it. All settings traffic runs through the hidden AT queue, so the terminal
+  stays clean. A console baud change is followed automatically (the port is
+  reopened at the new rate before `AT+SETTINGS=SAVE` is sent, so the new rate
+  persists). Entering the tab from the Map tab first restores the persisted
+  `PROTOCOL_OUT`/`LOG_LEVEL` so the form shows saved values, not the map stream's
+  overrides.
+  - The form renderer, dirty tracking, and save/refresh logic (`SettingsEngine`) are
+    **vendored verbatim** from
+    `firmware/adsbee_1090/esp/main/server/web/settings.js` (between that file's
+    `BEGIN/END SHARED SETTINGS ENGINE` markers) into this page's
+    `BEGIN/END VENDORED ADSBee settings engine` markers — edit it there and
+    re-copy. The 1421-specific parts (the `SETTINGS_SCHEMA_1421` table and the
+    AtQueue transport adapter) live just below the tab controller. To expose a new
+    AT command in the GUI, add one entry to the schema table.
 - **Upload Firmware** — flashes a `.hex` image (from
   `firmware/adsbee_1421/ti/build/<Config>/adsbee_1421-<ver>.hex`) via the
   CC13x4 factory ROM serial bootloader, a direct port of
@@ -65,20 +86,47 @@ Chrome or Edge (works from `file://`, no server needed) and click **Connect**
 
 ## Firmware upload wiring
 
-Bootloader entry uses hardware control lines (same as the Python flasher's `auto`
-mode): the adapter's **RTS must be wired to SYNC (DIO_5)** and **DTR to RESET_N**,
-with TX → DIO_2 and RX → DIO_3. The page holds SYNC high through a reset pulse so
-the boot ROM enters the serial bootloader; if that fails it falls back to
-`AT+REBOOT`-with-SYNC entry, then to a manual power-cycle prompt. The firmware's
-CCFG must enable the bootloader backdoor (see the flasher README).
+The device must be in the ROM bootloader **before** flashing, and putting it there is
+a manual step. The page does not drive the modem control lines to do it: that only
+worked on an adapter wired like the programmer jig, it spent ~40 s failing on any
+other adapter, and a failed attempt left SYNC high, which puts a running module to
+sleep. The dialog prints the procedure instead:
 
-Entry never erases anything by itself; erase begins only after the bootloader ACKs.
+1. Wire the adapter to the module: TX → SURX (pin 20, DIO_2), RX → SUTX (pin 21,
+   DIO_3), and ground to ground.
+2. Hold SYNC (pin 28, DIO_5) high at 3.3 V.
+3. With SYNC still high, reset the module: pull RESET_N (pin 17) low briefly, or
+   power-cycle it.
+4. Release reset. SYNC can stay high, since the boot ROM samples it only at boot.
+5. Press **Check bootloader**.
+
+The firmware's CCFG must enable the bootloader backdoor, which
+`firmware/adsbee_1421/ti/syscfg/adsbee_1421.syscfg` does (DIO_5, active high). The
+baud rate does not need to match anything: the ROM locks onto whatever rate the page
+sends its sync bytes at. If the SYNC pin is unreachable,
+`AT+BOOT_UART_BOOTLOADER=1DEADBEE` also enters the bootloader, at the cost of erasing
+the vector table, so the device stays there until it is reflashed.
+
+**Check bootloader** is the gate on flashing. It syncs, pings, and reads the chip ID,
+and only a device that answers all three unlocks the **Flash firmware** button. A
+failure says which failure it is: if the application firmware answers instead, it says
+so and names the baud; if nothing answers at all, it points at the wiring and power.
+The check is repeated as a single ping immediately before the first erase, so a device
+that was reset or unplugged between the check and the flash is caught while the image
+is still intact. Disconnecting the port, picking a different file, or closing the
+dialog all revoke a passed check.
+
+After a successful flash the device is restarted with the bootloader's own `RESET`
+command rather than a reset pulse. Return SYNC low first, or the reset lands back in
+the bootloader instead of running the new image.
+
+Nothing is erased by the check; erase begins only after the bootloader ACKs.
 Only the 2 KB flash sectors covered by the image are erased (`SECTOR_ERASE`, never a
 bank erase), so the module's Settings (`0x000FC000`) and Device Info / OTA keys
 (`0x000FE000`) survive a reflash; an image that reaches into those sectors is refused
 before anything is erased.
 If a flash fails partway, the device stays in the ROM bootloader — reopen the dialog
-and **Retry**. The board cannot be bricked (an interrupted flash leaves the
+and **Retry**, which re-runs the check before resuming. The board cannot be bricked (an interrupted flash leaves the
 factory-default CCFG, which keeps the bootloader enabled).
 
 ## Notes
@@ -86,8 +134,10 @@ factory-default CCFG, which keeps the bootloader enabled).
 - Requires Chrome or Edge (Web Serial). Firefox/Safari show an unsupported banner.
 - Map tiles load from openstreetmap.org and need internet; everything else works
   offline. Leaflet 1.9.4 is vendored inline (BSD-2-Clause, license header kept).
-- Connecting may briefly reset the device: Chromium asserts DTR when opening a
-  port, and DTR is wired to RESET_N. The page parks the lines in the normal-run
+- Connecting may briefly reset the device on an adapter whose DTR is wired to
+  RESET_N (the programmer jig): Chromium asserts DTR when opening a port. This is
+  the only remaining reason the page touches the control lines — it parks them in
+  the normal-run
   state immediately after opening.
 - The page is assembled by hand — Leaflet's JS/CSS are pasted between
   `BEGIN/END VENDORED` markers with the sourcemap comment and `url(images/...)`
